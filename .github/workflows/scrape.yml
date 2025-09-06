@@ -5,9 +5,8 @@ on:
   schedule:
     - cron: "0 * * * *"   # hourly
 
-# <-- give the Actions token write access so we can push the JSON
 permissions:
-  contents: write
+  contents: write   # allow pushing the generated JSON
 
 concurrency:
   group: coaching-feed
@@ -26,13 +25,14 @@ jobs:
 
       - run: npm ci || npm i
 
-      # retry once if the first scrape fails (network hiccups)
-      - name: Run scraper (with retry)
-        run: |
-          set -e
-          node scripts/coach-scraper.mjs || node scripts/coach-scraper.mjs
+      # Run the scraper; don't fail the job if it errors
+      - name: Run scraper
+        run: node scripts/coach-scraper.mjs
+        continue-on-error: true
 
+      # Always try to commit whatever JSON exists
       - name: Commit & push if changed
+        if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -41,3 +41,10 @@ jobs:
           git add docs/data/coaching.json
           git commit -m "chore: update coaching feed [skip ci]" || echo "No changes."
           git push https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }} HEAD:${{ github.ref_name }} || echo "Nothing to push"
+
+      # Save the produced JSON as an artifact for easy inspection
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coaching-json
+          path: docs/data/coaching.json
