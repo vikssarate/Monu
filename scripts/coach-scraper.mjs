@@ -1,4 +1,6 @@
-// Scrapes coaching/ed-prep sites and writes docs/data/coaching.json
+// scripts/coach-scraper.mjs
+// Scrapes coaching/ed-prep sites and writes docs/data/coaching.json (no govt portals)
+
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -7,29 +9,56 @@ import * as cheerio from "cheerio";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+/* ---------------- net helpers ---------------- */
+const DEFAULT_TIMEOUT = Number(process.env.HTTP_TIMEOUT_MS || 12000);
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+const BASE_HEADERS = {
+  "User-Agent": UA,
+  "Accept":
+    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+  "Accept-Language": "en-IN,en;q=0.9",
+  "Cache-Control": "no-cache",
+  Pragma: "no-cache",
+};
 
 const abs = (href, base) =>
   href?.startsWith("http") ? href : href ? new URL(href, base).toString() : null;
 
-async function timeoutFetch(url, { timeoutMs = 12000, ...opts } = {}) {
+async function timeoutFetch(url, { timeoutMs = DEFAULT_TIMEOUT, ...opts } = {}) {
   const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(new Error("Timeout")), timeoutMs);
+  const timer = setTimeout(() => ctrl.abort(new Error("Timeout")), timeoutMs);
   try {
     const res = await fetch(url, {
-      headers: { "User-Agent": UA, Accept: "text/html,*/*" },
+      headers: { ...BASE_HEADERS, ...(opts.headers || {}) },
       redirect: "follow",
       signal: ctrl.signal,
       ...opts,
     });
     if (!res.ok) throw new Error(`${res.status} ${res.statusText} for ${url}`);
-    return await res.text();
+    const html = await res.text();
+    if (!html || html.length < 400) throw new Error(`Empty HTML for ${url}`);
+    return html;
   } finally {
-    clearTimeout(t);
+    clearTimeout(timer);
   }
 }
 
+// small retry wrapper for flaky sites
+async function getHTML(url, { retries = 1, timeoutMs = DEFAULT_TIMEOUT } = {}) {
+  let lastErr;
+  for (let i = 0; i <= retries; i++) {
+    try {
+      return await timeoutFetch(url, { timeoutMs });
+    } catch (e) {
+      lastErr = e;
+      if (i < retries) await new Promise((r) => setTimeout(r, 1200 * (i + 1)));
+    }
+  }
+  throw lastErr;
+}
+
+/* ---------------- parsing helpers ---------------- */
 function parseDateToISO(s) {
   if (!s) return null;
   const t = s
@@ -60,7 +89,7 @@ function classifyChannel(title, fallback) {
   return fallback || "news";
 }
 
-/* -------- generic WP-ish parser -------- */
+/* ---------------- generic WP-ish parser ---------------- */
 function parseWordpressList(html, base, channel, sourceLabel) {
   const $ = cheerio.load(html);
   const items = [];
@@ -78,7 +107,11 @@ function parseWordpressList(html, base, channel, sourceLabel) {
     const dateTxt =
       root.find("time").attr("datetime") ||
       root.find("time").text().trim() ||
-      root.find("[class*='date'], .posted-on, .post-date, .elementor-post-date").first().text().trim() ||
+      root
+        .find("[class*='date'], .posted-on, .post-date, .elementor-post-date")
+        .first()
+        .text()
+        .trim() ||
       null;
 
     items.push({
@@ -99,7 +132,7 @@ function parseWordpressList(html, base, channel, sourceLabel) {
   return items;
 }
 
-/* -------- T.I.M.E. specific -------- */
+/* ---------------- T.I.M.E. specific ---------------- */
 function parseTIME_NotRes(html) {
   const $ = cheerio.load(html);
   const out = [];
@@ -153,13 +186,13 @@ function parseTIME_Blocks(html) {
   return out;
 }
 
-/* -------- source builders -------- */
+/* ---------------- source builders ---------------- */
 function makeWPScraper(label, base, pages) {
   return async function scrape() {
     const results = [];
     for (const p of pages) {
       try {
-        const html = await timeoutFetch(p.url);
+        const html = await getHTML(p.url, { retries: 1 });
         results.push(...parseWordpressList(html, base, p.channel, label));
       } catch (e) {
         results.push({ _error: `${label}: ${String(e)}` });
@@ -169,7 +202,7 @@ function makeWPScraper(label, base, pages) {
   };
 }
 
-/* -------- sources (coaching only) -------- */
+/* ---------------- sources (coaching only) ---------------- */
 const scrapeTestbook = makeWPScraper("Testbook", "https://testbook.com", [
   { url: "https://testbook.com/blog/latest-govt-jobs/", channel: "jobs" },
   { url: "https://testbook.com/blog/admit-card/", channel: "admit-card" },
@@ -189,17 +222,21 @@ const scrapeOliveboard = makeWPScraper("Oliveboard", "https://www.oliveboard.in"
 ]);
 
 async function scrapeTIME() {
-  const list1 = "https://www.time4education.com/local/articlecms/all.php?types=notres";
-  const list2 = "https://www.time4education.com/local/articlecms/all.php?course=Bank&type=articles";
   const out = [];
   try {
-    const html = await timeoutFetch(list1);
+    const html = await getHTML(
+      "https://www.time4education.com/local/articlecms/all.php?types=notres",
+      { retries: 1 }
+    );
     out.push(...parseTIME_NotRes(html));
   } catch (e) {
     out.push({ _error: `T.I.M.E. notres: ${String(e)}` });
   }
   try {
-    const html = await timeoutFetch(list2);
+    const html = await getHTML(
+      "https://www.time4education.com/local/articlecms/all.php?course=Bank&type=articles",
+      { retries: 1 }
+    );
     out.push(...parseTIME_Blocks(html));
   } catch (e) {
     out.push({ _error: `T.I.M.E. blocks: ${String(e)}` });
@@ -282,6 +319,7 @@ const SOURCES = [
   scrapeExamstocks,
 ];
 
+/* ---------------- aggregation ---------------- */
 function dedupeSort(items) {
   const byUrl = new Map();
   for (const it of items) {
@@ -294,7 +332,15 @@ function dedupeSort(items) {
   }
   const arr = Array.from(byUrl.values()).filter((x) => !x._error);
   arr.sort((a, b) => {
-    const order = { jobs: 0, "admit-card": 1, result: 2, "answer-key": 3, cutoff: 4, notification: 5, news: 6 };
+    const order = {
+      jobs: 0,
+      "admit-card": 1,
+      result: 2,
+      "answer-key": 3,
+      cutoff: 4,
+      notification: 5,
+      news: 6,
+    };
     const ra = order[a.channel] ?? 99;
     const rb = order[b.channel] ?? 99;
     if (ra !== rb) return ra - rb;
@@ -303,33 +349,65 @@ function dedupeSort(items) {
   return arr;
 }
 
+/* ---------------- main ---------------- */
 async function main() {
   const only = (process.env.ONLY || "").split(",").filter(Boolean);
   const pick = (process.env.SOURCE || "").split(",").filter(Boolean);
 
   const chunks = await Promise.allSettled(SOURCES.map((fn) => fn()));
   let items = [];
-  for (const r of chunks) if (r.status === "fulfilled") items.push(...r.value);
+  const errors = [];
+
+  for (const r of chunks) {
+    if (r.status === "fulfilled") {
+      const ok = r.value.filter((x) => !x._error);
+      const errs = r.value.filter((x) => x._error).map((x) => x._error);
+      items.push(...ok);
+      errors.push(...errs);
+    } else {
+      errors.push(String(r.reason));
+    }
+  }
 
   if (only.length) items = items.filter((x) => only.includes(x.channel));
-  if (pick.length)  items = items.filter((x) => pick.some((s) => x.source.toLowerCase().includes(s.toLowerCase())));
+  if (pick.length)
+    items = items.filter((x) =>
+      pick.some((s) => x.source.toLowerCase().includes(s.toLowerCase()))
+    );
 
   items = dedupeSort(items);
+
   const out = {
     ok: true,
     updatedAt: new Date().toISOString(),
     count: items.length,
-    items
+    items,
   };
+  if (process.env.DEBUG === "1") out.errors = errors.slice(0, 30);
 
   const outDir = path.join(__dirname, "..", "docs", "data");
-  const outFile = path.join(outDir, "coaching.json");
   fs.mkdirSync(outDir, { recursive: true });
+  const outFile = path.join(outDir, "coaching.json");
   fs.writeFileSync(outFile, JSON.stringify(out, null, 2));
   console.log(`Wrote ${out.count} items to ${path.relative(process.cwd(), outFile)}`);
 }
 
-main().catch((e) => {
-  console.error("SCRAPE FAILED:", e);
-  process.exit(1);
-});
+/* Always write a JSON file, even if something blows up */
+(async () => {
+  try {
+    await main();
+  } catch (e) {
+    console.error("SCRAPE FAILED:", e && (e.stack || e));
+    const fallback = {
+      ok: false,
+      updatedAt: new Date().toISOString(),
+      count: 0,
+      items: [],
+      error: String(e.message || e),
+    };
+    const outDir = path.join(__dirname, "..", "docs", "data");
+    fs.mkdirSync(outDir, { recursive: true });
+    fs.writeFileSync(path.join(outDir, "coaching.json"), JSON.stringify(fallback, null, 2));
+    // NOTE: don't throw—let the workflow commit the file
+  }
+})();
